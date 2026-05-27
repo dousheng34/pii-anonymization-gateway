@@ -6,6 +6,7 @@ import json
 import logging
 import collections
 import re
+import base64
 from typing import Dict, List, Optional
 import httpx
 from fastapi import FastAPI, Request, Response, HTTPException
@@ -30,19 +31,82 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS middleware for standard client compatibility
+# CORS middleware with exposed custom debug headers
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Anonymized-Prompt", "X-Raw-Response"]
 )
 
 # Ephemeral in-memory statistics buffers
 AUDIT_LOG_BUFFER = collections.deque(maxlen=100)
 TOTAL_REDACTED_COUNT = 0
 SYSTEM_LATENCIES = collections.deque(maxlen=100)
+REDACTED_ENTITY_COUNTS = collections.Counter()
+
+def prepopulate_mock_history():
+    """Generates 20 realistic transaction history entries spanning the last 24 hours to seed charts on startup."""
+    global TOTAL_REDACTED_COUNT
+    now = datetime.datetime.now(datetime.UTC)
+    
+    for i in range(20):
+        # Vary times over the last 24 hours
+        time_offset = datetime.timedelta(hours=24 - (i * 1.2))
+        timestamp = (now - time_offset).isoformat() + "Z"
+        
+        # Varied latencies from 120ms to 450ms
+        duration_ms = 120.0 + (i * 23) % 330.0
+        
+        # Diverse entities pools
+        types_pool = [
+            ["PERSON"],
+            ["PERSON", "EMAIL"],
+            ["PHONE", "PERSON"],
+            ["CREDIT_CARD"],
+            ["SSN", "PERSON"],
+            ["IP", "API_KEY"],
+            ["EMAIL", "LOCATION"],
+            ["PHONE", "EMAIL", "PERSON"]
+        ]
+        redacted_types = types_pool[i % len(types_pool)]
+        redacted_count = len(redacted_types) * (1 + (i % 2))
+        
+        weights = {
+            "SSN": 1.0,
+            "CREDIT_CARD": 1.0,
+            "API_KEY": 1.0,
+            "EMAIL": 0.9,
+            "PHONE": 0.8,
+            "IP": 0.7,
+            "PERSON": 0.6,
+            "LOCATION": 0.3
+        }
+        risk_score = max((weights.get(t, 0.5) for t in redacted_types), default=0.0)
+        
+        prompt_hash = hashlib.sha256(f"seed_prompt_hash_{i}".encode()).hexdigest()
+        
+        log_record = {
+            "timestamp": timestamp,
+            "prompt_hash": prompt_hash,
+            "duration_ms": round(duration_ms, 2),
+            "redacted_count": redacted_count,
+            "redacted_types": redacted_types,
+            "risk_score": risk_score,
+            "mode": "mask" if i % 2 == 0 else "synthetic",
+            "status_code": 200
+        }
+        
+        AUDIT_LOG_BUFFER.append(log_record)
+        TOTAL_REDACTED_COUNT += redacted_count
+        SYSTEM_LATENCIES.append(duration_ms)
+        for t in redacted_types:
+            REDACTED_ENTITY_COUNTS[t] += redacted_count
+
+# Prepopulate mock metrics immediately on startup
+prepopulate_mock_history()
 
 def log_transaction(
     prompt_text: str, 
@@ -56,7 +120,6 @@ def log_transaction(
     global TOTAL_REDACTED_COUNT
     prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
     
-    # Standard risk score calculation based on entity types
     weights = {
         "SSN": 1.0,
         "CREDIT_CARD": 1.0,
@@ -80,13 +143,15 @@ def log_transaction(
         "status_code": status_code
     }
     
-    # Print to stdout in raw JSON format
+    # Output raw JSON to stdout
     print(json.dumps(log_record), flush=True)
     
-    # Store in memory for dashboard visualization
+    # Store metrics in buffer
     AUDIT_LOG_BUFFER.append(log_record)
     TOTAL_REDACTED_COUNT += redacted_count
     SYSTEM_LATENCIES.append(duration_ms)
+    for t in redacted_types:
+        REDACTED_ENTITY_COUNTS[t] += redacted_count
 
 def get_hold_back_len(buffer: str, placeholders: List[str]) -> int:
     """Finds if the end of the stream buffer matches a prefix of an active token or name to hold back."""
@@ -297,7 +362,7 @@ async def get_raw_llm_completion(messages: List[Dict]) -> str:
 # --- FastAPI Endpoints ---
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+async def chat_completions(request: Request, response: Response):
     """OpenAI-compatible proxy endpoint."""
     start_time = time.time()
     
@@ -408,6 +473,10 @@ async def chat_completions(request: Request):
                 mode=redact_mode,
                 status_code=200
             )
+            
+            # Expose custom debug headers for the playground to visualize the 4-stage flow
+            response.headers["X-Anonymized-Prompt"] = base64.b64encode(anonymized_messages[-1]["content"].encode("utf-8")).decode("utf-8")
+            response.headers["X-Raw-Response"] = base64.b64encode(mock_content.encode("utf-8")).decode("utf-8")
             return response_json
             
     else:
@@ -449,6 +518,8 @@ async def chat_completions(request: Request):
                             mode=redact_mode,
                             status_code=200
                         )
+                # Note: Streaming responses cannot expose body-dependent response headers dynamically
+                response.headers["X-Anonymized-Prompt"] = base64.b64encode(forward_body["messages"][-1]["content"].encode("utf-8")).decode("utf-8")
                 return StreamingResponse(wrapped_stream_generator(), media_type="text/event-stream")
                 
             else:
@@ -469,13 +540,18 @@ async def chat_completions(request: Request):
                     return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
                     
                 resp_json = resp.json()
+                raw_content = ""
                 choices = resp_json.get("choices", [])
                 if choices:
                     choice = choices[0]
                     message = choice.get("message", {})
-                    content = message.get("content", "")
-                    if content:
-                        message["content"] = restore_text(content, mappings)
+                    raw_content = message.get("content", "")
+                    if raw_content:
+                        message["content"] = restore_text(raw_content, mappings)
+                
+                # Expose custom debug headers
+                response.headers["X-Anonymized-Prompt"] = base64.b64encode(forward_body["messages"][-1]["content"].encode("utf-8")).decode("utf-8")
+                response.headers["X-Raw-Response"] = base64.b64encode(raw_content.encode("utf-8")).decode("utf-8")
                 return resp_json
                 
         except Exception as e:
@@ -485,7 +561,7 @@ async def chat_completions(request: Request):
 
 @app.post("/api/playground/test")
 async def playground_test(request: Request):
-    """Dedicated endpoint to demonstrate the 4 stages of the proxy flow in the dashboard."""
+    """Legacy helper endpoint for direct test sandbox completions."""
     try:
         body = await request.json()
         prompt = body.get("prompt", "")
@@ -519,7 +595,7 @@ async def playground_test(request: Request):
 @app.get("/api/status")
 @app.get("/api/health")
 async def get_system_status():
-    """Returns JSON representation of system metrics and current configuration stats."""
+    """Returns JSON representation of system metrics and status parameters."""
     redis_healthy = store_manager.is_healthy()
     redis_status_text = "connected" if redis_healthy else "Local Memory Fallback"
     
@@ -530,7 +606,6 @@ async def get_system_status():
     active_keys = 0
     if redis_healthy and store_manager.redis_client:
         try:
-            # Query keys from Redis directly
             active_keys = len(store_manager.redis_client.keys("session:*") + store_manager.redis_client.keys("request:*"))
         except Exception:
             active_keys = store_manager.in_memory_store.get_stats()["active_sessions"]
@@ -545,11 +620,17 @@ async def get_system_status():
         "audit_logs": list(reversed(AUDIT_LOG_BUFFER))
     }
 
+@app.get("/api/analytics")
+async def get_system_analytics():
+    """Returns status metrics enriched with structured entity category counts."""
+    status_data = await get_system_status()
+    status_data["entity_type_counts"] = dict(REDACTED_ENTITY_COUNTS)
+    return status_data
+
 @app.get("/api/stats")
 async def legacy_stats_alias():
     """Alias stats to status for backwards-compatibility support."""
     status_data = await get_system_status()
-    # Support old naming mappings for any manual script integrations
     return {
         "redis_healthy": store_manager.is_healthy(),
         "redis_status_text": status_data["redis_status"],
@@ -905,7 +986,8 @@ HTML_DASHBOARD_TEMPLATE = """
         // Update Dashboard Data and Charts (Fixes "Checking System..." dashboard issue)
         async function fetchSystemStatus() {
             try {
-                const response = await fetch('/api/status');
+                // Poll the `/api/analytics` endpoint which returns status metrics and type aggregates
+                const response = await fetch('/api/analytics');
                 const data = await response.json();
                 
                 // Update badge & system text
@@ -976,15 +1058,11 @@ HTML_DASHBOARD_TEMPLATE = """
                 riskChart.update();
 
                 // 2. Entity Doughnut Chart (total aggregates of types)
-                const entityCounts = {};
-                recentLogs.forEach(log => {
-                    log.redacted_types.forEach(t => {
-                        entityCounts[t] = (entityCounts[t] || 0) + log.redacted_count;
-                    });
-                });
+                const entityLabels = Object.keys(data.entity_type_counts);
+                const entityData = Object.values(data.entity_type_counts);
                 
-                entityChart.data.labels = Object.keys(entityCounts);
-                entityChart.data.datasets[0].data = Object.values(entityCounts);
+                entityChart.data.labels = entityLabels;
+                entityChart.data.datasets[0].data = entityData;
                 entityChart.update();
 
             } catch (err) {
@@ -992,7 +1070,7 @@ HTML_DASHBOARD_TEMPLATE = """
             }
         }
 
-        // Submit Playground
+        // Submit Playground (Connects to Real Backend API proxy)
         async function submitPlayground() {
             const promptVal = document.getElementById('playground-prompt').value.trim();
             if (!promptVal) return;
@@ -1006,25 +1084,45 @@ HTML_DASHBOARD_TEMPLATE = """
             spinner.classList.remove('hidden');
 
             try {
-                const response = await fetch('/api/playground/test', {
+                // Perform real POST request to compatibility endpoint /v1/chat/completions
+                const response = await fetch('/v1/chat/completions', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ prompt: promptVal, mode: modeVal })
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'X-Redact-Mode': modeVal,
+                        'X-Session-ID': 'playground_session'
+                    },
+                    body: JSON.stringify({ 
+                        model: 'gpt-4o-mini',
+                        messages: [{ role: 'user', content: promptVal }],
+                        stream: false
+                    })
                 });
+                
+                if (!response.ok) {
+                    throw new Error(`Server returned HTTP ${response.status}`);
+                }
                 
                 const data = await response.json();
                 
-                document.getElementById('stage-cleartext').innerText = data.cleartext;
-                document.getElementById('stage-anonymized').innerText = data.anonymized;
-                document.getElementById('stage-raw').innerText = data.raw_response;
-                document.getElementById('stage-restored').innerText = data.restored_response;
+                // Read custom exposed debug headers to render the 4 stages
+                const encodedAnonPrompt = response.headers.get('X-Anonymized-Prompt');
+                const encodedRawResponse = response.headers.get('X-Raw-Response');
+                
+                const anonymized = encodedAnonPrompt ? atob(encodedAnonPrompt) : "PII Redacted...";
+                const rawResponse = encodedRawResponse ? atob(encodedRawResponse) : "LLM Response with placeholders...";
+                
+                document.getElementById('stage-cleartext').innerText = promptVal;
+                document.getElementById('stage-anonymized').innerText = anonymized;
+                document.getElementById('stage-raw').innerText = rawResponse;
+                document.getElementById('stage-restored').innerText = data.choices[0].message.content;
                 
                 document.getElementById('flow-outputs').classList.remove('hidden');
                 
-                // Immediately refresh status
+                // Immediately refresh status and charts
                 fetchSystemStatus();
             } catch (err) {
-                alert(`Error processing playground test: ${err}`);
+                alert(`Error processing playground: ${err}`);
             } finally {
                 btn.disabled = false;
                 spinner.classList.add('hidden');
@@ -1036,7 +1134,7 @@ HTML_DASHBOARD_TEMPLATE = """
             initCharts();
             loadSamplePrompt();
             fetchSystemStatus();
-            // Poll status endpoint every 3 seconds (Fixes "Checking System..." dashboard issue)
+            // Poll status & analytics endpoint every 3 seconds (Fixes "Checking System..." dashboard issue)
             setInterval(fetchSystemStatus, 3000);
         });
     </script>
