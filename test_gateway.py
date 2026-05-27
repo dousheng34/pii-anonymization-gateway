@@ -11,13 +11,23 @@ def test_dashboard():
     print("[OK] Dashboard endpoint returns HTML dashboard.")
 
 def test_stats():
+    # Test legacy stats alias
     response = client.get("/api/stats")
     assert response.status_code == 200
     data = response.json()
     assert "redis_healthy" in data
     assert "total_redacted_count" in data
+    
+    # Test new status endpoint
+    response = client.get("/api/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert "redis_status" in data
+    assert "active_keys_count" in data
+    assert "average_latency_ms" in data
+    assert "cumulative_redacted_count" in data
     assert "audit_logs" in data
-    print("[OK] Stats endpoint returns JSON statistics.")
+    print("[OK] Status & stats endpoints return correct JSON schemas.")
 
 def test_playground():
     prompt = "Hello! My name is John Doe, email is john@google.com, phone is 555-0101."

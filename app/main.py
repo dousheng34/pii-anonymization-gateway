@@ -514,34 +514,49 @@ async def playground_test(request: Request):
         "restored_response": restored_response
     }
 
-@app.get("/api/stats")
-async def get_stats():
-    """Exposes statistics, Redis status, and logs buffer to the dashboard."""
-    # Check redis connection status
+# --- Status & Analytics API Endpoints (Fixes "Checking System..." dashboard issue) ---
+
+@app.get("/api/status")
+@app.get("/api/health")
+async def get_system_status():
+    """Returns JSON representation of system metrics and current configuration stats."""
     redis_healthy = store_manager.is_healthy()
-    redis_status_text = "Connected" if redis_healthy else "Local Memory Fallback"
+    redis_status_text = "connected" if redis_healthy else "Local Memory Fallback"
     
     avg_latency = 0.0
     if SYSTEM_LATENCIES:
         avg_latency = sum(SYSTEM_LATENCIES) / len(SYSTEM_LATENCIES)
         
-    active_sessions = 0
+    active_keys = 0
     if redis_healthy and store_manager.redis_client:
         try:
-            # Estimate active keys
-            active_sessions = len(store_manager.redis_client.keys("session:*") + store_manager.redis_client.keys("request:*"))
+            # Query keys from Redis directly
+            active_keys = len(store_manager.redis_client.keys("session:*") + store_manager.redis_client.keys("request:*"))
         except Exception:
-            active_sessions = store_manager.in_memory_store.get_stats()["active_sessions"]
+            active_keys = store_manager.in_memory_store.get_stats()["active_sessions"]
     else:
-        active_sessions = store_manager.in_memory_store.get_stats()["active_sessions"]
+        active_keys = store_manager.in_memory_store.get_stats()["active_sessions"]
         
     return {
-        "redis_healthy": redis_healthy,
-        "redis_status_text": redis_status_text,
+        "redis_status": redis_status_text,
+        "active_keys_count": active_keys,
         "average_latency_ms": round(avg_latency, 2),
-        "total_redacted_count": TOTAL_REDACTED_COUNT,
-        "active_sessions_count": active_sessions,
+        "cumulative_redacted_count": TOTAL_REDACTED_COUNT,
         "audit_logs": list(reversed(AUDIT_LOG_BUFFER))
+    }
+
+@app.get("/api/stats")
+async def legacy_stats_alias():
+    """Alias stats to status for backwards-compatibility support."""
+    status_data = await get_system_status()
+    # Support old naming mappings for any manual script integrations
+    return {
+        "redis_healthy": store_manager.is_healthy(),
+        "redis_status_text": status_data["redis_status"],
+        "average_latency_ms": status_data["average_latency_ms"],
+        "total_redacted_count": status_data["cumulative_redacted_count"],
+        "active_sessions_count": status_data["active_keys_count"],
+        "audit_logs": status_data["audit_logs"]
     }
 
 @app.get("/", response_class=HTMLResponse)
@@ -774,7 +789,7 @@ HTML_DASHBOARD_TEMPLATE = """
 
     <!-- App Dashboard JS -->
     <script>
-        const SAMPLE_PROMPT = "Hi, my name is John Doe. I am working at Google. My phone number is 555-0101, email address is john.doe@google.com, and my IP is 192.168.1.101. Also, here is my OpenAI API key: sk-proj-1234567890abcdef1234567890abcdef1234567890abcdef. Can you summarize this info?";
+        const SAMPLE_PROMPT = "Hi, my name is John Doe. I am working at Google. My phone number is 555-555-0199, email address is john.doe@google.com, and my IP is 192.168.1.101. Also, here is my OpenAI API key: sk-proj-1234567890abcdef1234567890abcdef1234567890abcdef. Can you summarize this info?";
         
         function loadSamplePrompt() {
             document.getElementById('playground-prompt').value = SAMPLE_PROMPT;
@@ -887,27 +902,28 @@ HTML_DASHBOARD_TEMPLATE = """
             });
         }
 
-        // Update Dashboard Data and Charts
-        async function fetchStats() {
+        // Update Dashboard Data and Charts (Fixes "Checking System..." dashboard issue)
+        async function fetchSystemStatus() {
             try {
-                const response = await fetch('/api/stats');
+                const response = await fetch('/api/status');
                 const data = await response.json();
                 
                 // Update badge & system text
                 const statusBadge = document.getElementById('status-badge');
                 const statusText = document.getElementById('status-text');
                 
-                statusText.innerText = data.redis_status_text;
-                if (data.redis_healthy) {
+                if (data.redis_status === 'connected') {
+                    statusText.innerText = "System Connected";
                     statusBadge.className = "px-3 py-1.5 rounded-full text-xs font-semibold flex items-center space-x-2 bg-emerald-500/10 text-emerald-400 glow-border-green";
                 } else {
+                    statusText.innerText = "Local Memory Fallback";
                     statusBadge.className = "px-3 py-1.5 rounded-full text-xs font-semibold flex items-center space-x-2 bg-amber-500/10 text-amber-400 glow-border-amber";
                 }
 
                 // Update text stats
                 document.getElementById('avg-latency').innerText = `${data.average_latency_ms} ms`;
-                document.getElementById('total-redacted').innerText = data.total_redacted_count;
-                document.getElementById('active-sessions').innerText = data.active_sessions_count;
+                document.getElementById('total-redacted').innerText = data.cumulative_redacted_count;
+                document.getElementById('active-sessions').innerText = data.active_keys_count;
 
                 // Update logs feed
                 const feed = document.getElementById('logs-feed');
@@ -1005,8 +1021,8 @@ HTML_DASHBOARD_TEMPLATE = """
                 
                 document.getElementById('flow-outputs').classList.remove('hidden');
                 
-                // Immediately refresh stats
-                fetchStats();
+                // Immediately refresh status
+                fetchSystemStatus();
             } catch (err) {
                 alert(`Error processing playground test: ${err}`);
             } finally {
@@ -1019,9 +1035,9 @@ HTML_DASHBOARD_TEMPLATE = """
         window.addEventListener('load', () => {
             initCharts();
             loadSamplePrompt();
-            fetchStats();
-            // Poll statistics every 2 seconds
-            setInterval(fetchStats, 2000);
+            fetchSystemStatus();
+            // Poll status endpoint every 3 seconds (Fixes "Checking System..." dashboard issue)
+            setInterval(fetchSystemStatus, 3000);
         });
     </script>
 </body>

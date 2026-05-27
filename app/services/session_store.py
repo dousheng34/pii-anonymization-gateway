@@ -9,22 +9,35 @@ from app.services.crypto import encrypt_value, decrypt_value
 
 logger = logging.getLogger("pii_gateway.session_store")
 
-# Thread-safe in-memory store for fallback operations
 class InMemorySessionStore:
     def __init__(self):
         self._data: Dict[str, Dict] = {}
         self._lock = threading.Lock()
+        
+        # Start background cleanup daemon thread
+        self._start_cleanup_daemon()
 
     def _cleanup_expired(self):
-        """Removes expired entries from the cache."""
+        """Purges keys older than their expiration timestamp."""
         now = time.time()
-        expired_keys = [k for k, v in self._data.items() if v["expires_at"] < now]
-        for k in expired_keys:
-            self._data.pop(k, None)
+        with self._lock:
+            expired_keys = [k for k, v in self._data.items() if v["expires_at"] < now]
+            for k in expired_keys:
+                self._data.pop(k, None)
+
+    def _start_cleanup_daemon(self):
+        """Starts a background thread that executes cleanup every 10 seconds."""
+        def cleanup_loop():
+            while True:
+                time.sleep(10)
+                self._cleanup_expired()
+        
+        t = threading.Thread(target=cleanup_loop, daemon=True)
+        t.start()
+        logger.info("In-memory session cleanup background task started.")
 
     def set(self, key: str, value: str, ttl: int = 300):
         with self._lock:
-            self._cleanup_expired()
             self._data[key] = {
                 "value": value,
                 "expires_at": time.time() + ttl
@@ -32,20 +45,21 @@ class InMemorySessionStore:
 
     def get(self, key: str) -> Optional[str]:
         with self._lock:
-            self._cleanup_expired()
             entry = self._data.get(key)
-            if entry and entry["expires_at"] > time.time():
-                return entry["value"]
-            # Clean up if expired
             if entry:
-                self._data.pop(key, None)
+                if entry["expires_at"] > time.time():
+                    return entry["value"]
+                else:
+                    self._data.pop(key, None)
             return None
 
     def get_stats(self) -> Dict:
         with self._lock:
-            self._cleanup_expired()
+            # Active non-expired keys count
+            now = time.time()
+            active_keys = [k for k, v in self._data.items() if v["expires_at"] > now]
             return {
-                "active_sessions": len(self._data)
+                "active_sessions": len(active_keys)
             }
 
 
@@ -57,7 +71,7 @@ class SessionStoreManager:
         self.connect_redis()
 
     def connect_redis(self):
-        """Attempts to connect to Redis and ping the server."""
+        """Tries to connect to Redis and ping the server."""
         try:
             self.redis_client = redis.Redis.from_url(
                 settings.REDIS_URL, 
@@ -74,7 +88,7 @@ class SessionStoreManager:
             )
 
     def is_healthy(self) -> bool:
-        """Pings Redis to check health, dynamically updating online status."""
+        """Pings Redis to check health status, updating online state."""
         if not self.redis_client:
             return False
         try:
@@ -88,7 +102,7 @@ class SessionStoreManager:
             return False
 
     def save_session_mapping(self, session_key: str, mappings: Dict[str, str], ttl: int = 300) -> bool:
-        """Serializes, encrypts, and stores session mappings under session_key."""
+        """Serializes, encrypts, and caches the mappings."""
         try:
             serialized = json.dumps(mappings)
             encrypted = encrypt_value(serialized)
@@ -107,21 +121,20 @@ class SessionStoreManager:
             self.in_memory_store.set(session_key, encrypted, ttl)
             return True
         except Exception as e:
-            logger.critical(f"In-memory session store failed to write: {e}")
+            logger.critical(f"In-memory store failed to write mapping: {e}")
             return False
 
     def load_session_mapping(self, session_key: str) -> Dict[str, str]:
-        """Loads, decrypts, and deserializes session mappings from the store."""
+        """Loads, decrypts, and returns the session mappings dictionary."""
         encrypted = None
         try:
             if self.is_healthy():
                 encrypted = self.redis_client.get(session_key)
         except Exception as e:
-            logger.error(f"Redis read failed, trying in-memory fallback: {e}")
+            logger.error(f"Redis read failed, trying memory fallback: {e}")
             self.redis_online = False
 
         if encrypted is None:
-            # Try in-memory store
             encrypted = self.in_memory_store.get(session_key)
 
         if not encrypted:
